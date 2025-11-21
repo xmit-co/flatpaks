@@ -1,0 +1,213 @@
+name: Build Flatpak
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  FLATPAK_ID: com.onclebob.Bob
+
+jobs:
+  build:
+    name: Build Flatpak (${{ matrix.arch }})
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install flatpak-builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+
+      - name: Add Flathub repository
+        run: |
+          sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+
+      - name: Install Flatpak SDK and runtime
+        run: |
+          sudo flatpak install -y flathub org.freedesktop.Platform//25.08 org.freedesktop.Sdk//25.08
+          sudo flatpak install -y flathub org.freedesktop.Sdk.Extension.llvm21//25.08
+
+      - name: Build Flatpak
+        run: |
+          flatpak-builder --arch=${{ matrix.arch }} \
+            --repo=repo \
+            --force-clean \
+            --ccache \
+            --install-deps-from=flathub \
+            build-dir \
+            ${{ env.FLATPAK_ID }}.yml
+
+      - name: Create Flatpak bundle
+        run: |
+          flatpak build-bundle repo \
+            ${{ env.FLATPAK_ID }}-${{ matrix.arch }}.flatpak \
+            ${{ env.FLATPAK_ID }} \
+            --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo
+
+      - name: Import GPG key
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "allow-preset-passphrase" >> ~/.gnupg/gpg-agent.conf
+          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
+          gpg-connect-agent reloadagent /bye
+
+      - name: Sign Flatpak bundle
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          GPG_KEY_ID=$(gpg --list-secret-keys --keyid-format LONG | grep sec | awk '{print $2}' | cut -d'/' -f2 | head -n1)
+          echo "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+            --detach-sign --armor \
+            --output ${{ env.FLATPAK_ID }}-${{ matrix.arch }}.flatpak.sig \
+            ${{ env.FLATPAK_ID }}-${{ matrix.arch }}.flatpak
+
+      - name: Generate checksums
+        run: |
+          sha256sum ${{ env.FLATPAK_ID }}-${{ matrix.arch }}.flatpak > ${{ env.FLATPAK_ID }}-${{ matrix.arch }}.flatpak.sha256
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-${{ matrix.arch }}
+          path: |
+            ${{ env.FLATPAK_ID }}-${{ matrix.arch }}.flatpak
+            ${{ env.FLATPAK_ID }}-${{ matrix.arch }}.flatpak.sig
+            ${{ env.FLATPAK_ID }}-${{ matrix.arch }}.flatpak.sha256
+          retention-days: 30
+
+      - name: Upload OSTree repository
+        uses: actions/upload-artifact@v4
+        with:
+          name: ostree-repo-${{ matrix.arch }}
+          path: repo/
+          retention-days: 7
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          find artifacts -name "*.flatpak" -exec cp {} release/ \;
+          find artifacts -name "*.flatpak.sig" -exec cp {} release/ \;
+          find artifacts -name "*.flatpak.sha256" -exec cp {} release/ \;
+          ls -lah release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-repo:
+    name: Publish OSTree Repository
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Download OSTree repositories
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ostree-repo-*
+          path: repos
+
+      - name: Install OSTree
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ostree
+
+      - name: Merge OSTree repositories
+        run: |
+          ostree init --repo=dist --mode=archive-z2
+
+          # Find all downloaded repo directories
+          for repo_dir in repos/ostree-repo-*/; do
+            if [ -d "$repo_dir" ] && [ -f "$repo_dir/config" ]; then
+              echo "Processing repository: $repo_dir"
+
+              # Create refs/remotes directory if it doesn't exist to prevent errors
+              mkdir -p "$repo_dir/refs/remotes"
+
+              # List available refs in source repo
+              echo "Available refs in source repo:"
+              ostree refs --repo="$repo_dir" || echo "No refs found"
+
+              # Pull all refs from the source repo
+              for ref in $(ostree refs --repo="$repo_dir" 2>/dev/null || true); do
+                echo "Pulling ref: $ref"
+                ostree pull-local --repo=dist "$repo_dir" "$ref" || echo "Warning: Failed to pull $ref"
+              done
+            fi
+          done
+
+          # List what we have in the merged repo
+          echo "Merged repository contents:"
+          ostree refs --repo=dist || echo "No refs found in merged repo"
+
+      - name: Import GPG key for repo signing
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "allow-preset-passphrase" >> ~/.gnupg/gpg-agent.conf
+          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
+          gpg-connect-agent reloadagent /bye
+          GPG_KEY_ID=$(gpg --list-secret-keys --keyid-format LONG | grep sec | awk '{print $2}' | cut -d'/' -f2 | head -n1)
+          echo "GPG_KEY_ID=$GPG_KEY_ID" >> $GITHUB_ENV
+
+          # Get the keygrip for the signing key
+          KEYGRIP=$(gpg --with-keygrip --list-secret-keys "$GPG_KEY_ID" | grep "Keygrip" | head -n1 | awk '{print $3}')
+
+          # Preset the passphrase in the gpg-agent cache
+          echo "$GPG_PASSPHRASE" | /usr/lib/gnupg/gpg-preset-passphrase --preset "$KEYGRIP"
+
+      - name: Sign OSTree repository
+        run: |
+          ostree summary --repo=dist --update --gpg-sign=${{ env.GPG_KEY_ID }} --gpg-homedir=$HOME/.gnupg
+
+      - name: Install xmit
+        run: |
+          XMIT_VERSION=$(curl -s https://api.github.com/repos/xmit-co/xmit/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          curl -sL "https://github.com/xmit-co/xmit/releases/download/${XMIT_VERSION}/xmit_${XMIT_VERSION#v}_linux_amd64.tgz" -o xmit.tgz
+          tar -xzf xmit.tgz
+          chmod +x xmit_${XMIT_VERSION#v}_linux_amd64/xmit
+          sudo mv xmit_${XMIT_VERSION#v}_linux_amd64/xmit /usr/local/bin/
+
+      - name: Upload to xmit
+        env:
+          XMIT_KEY: ${{ secrets.XMIT_KEY }}
+        run: |
+          /usr/local/bin/xmit flatpak.onclebob.com
