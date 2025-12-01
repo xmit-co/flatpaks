@@ -41,6 +41,6 @@ modules:
       - pubspec-sources.json
       - type: git
         url: https://github.com/xmit-co/bob.git
-        tag: v0.0.3
+        tag: v0.0.4
     modules:
       - flutter-sdk-3.38.3.json
