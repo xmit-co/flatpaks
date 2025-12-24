@@ -40,7 +40,35 @@ jobs:
           sudo flatpak install -y flathub org.freedesktop.Platform//25.08 org.freedesktop.Sdk//25.08
           sudo flatpak install -y flathub org.freedesktop.Sdk.Extension.llvm21//25.08
 
-      - name: Build Flatpak
+      - name: Import GPG key for build signing
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "allow-preset-passphrase" >> ~/.gnupg/gpg-agent.conf
+          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
+          gpg-connect-agent reloadagent /bye
+          GPG_KEY_ID=$(gpg --list-secret-keys --keyid-format LONG | grep sec | awk '{print $2}' | cut -d'/' -f2 | head -n1)
+          echo "GPG_KEY_ID=$GPG_KEY_ID" >> $GITHUB_ENV
+          KEYGRIP=$(gpg --with-keygrip --list-secret-keys "$GPG_KEY_ID" | grep "Keygrip" | head -n1 | awk '{print $3}')
+          echo "$GPG_PASSPHRASE" | /usr/lib/gnupg/gpg-preset-passphrase --preset "$KEYGRIP"
+
+      - name: Build Flatpak (signed)
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        run: |
+          flatpak-builder --arch=${{ matrix.arch }} \
+            --repo=repo \
+            --force-clean \
+            --ccache \
+            --install-deps-from=flathub \
+            --gpg-sign=${{ env.GPG_KEY_ID }} \
+            build-dir \
+            ${{ env.FLATPAK_ID }}.yml
+
+      - name: Build Flatpak (unsigned, for PRs)
+        if: github.event_name != 'push' || (github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/'))
         run: |
           flatpak-builder --arch=${{ matrix.arch }} \
             --repo=repo \
@@ -57,23 +85,11 @@ jobs:
             ${{ env.FLATPAK_ID }} \
             --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo
 
-      - name: Import GPG key
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-        run: |
-          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-          echo "allow-preset-passphrase" >> ~/.gnupg/gpg-agent.conf
-          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
-          gpg-connect-agent reloadagent /bye
-
       - name: Sign Flatpak bundle
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
         env:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
-          GPG_KEY_ID=$(gpg --list-secret-keys --keyid-format LONG | grep sec | awk '{print $2}' | cut -d'/' -f2 | head -n1)
           echo "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
             --detach-sign --armor \
             --output ${{ env.FLATPAK_ID }}-${{ matrix.arch }}.flatpak.sig \
@@ -198,16 +214,42 @@ jobs:
         run: |
           ostree summary --repo=dist --update --gpg-sign=${{ env.GPG_KEY_ID }} --gpg-homedir=$HOME/.gnupg
 
-      - name: Install xmit
+      - name: Export GPG public key and create repo files
         run: |
-          XMIT_VERSION=$(curl -s https://api.github.com/repos/xmit-co/xmit/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-          curl -sL "https://github.com/xmit-co/xmit/releases/download/${XMIT_VERSION}/xmit_${XMIT_VERSION#v}_linux_amd64.tgz" -o xmit.tgz
-          tar -xzf xmit.tgz
-          chmod +x xmit_${XMIT_VERSION#v}_linux_amd64/xmit
-          sudo mv xmit_${XMIT_VERSION#v}_linux_amd64/xmit /usr/local/bin/
+          # Export GPG public key in base64 format for flatpak files
+          GPG_PUBLIC_KEY=$(gpg --export ${{ env.GPG_KEY_ID }} | base64 -w 0)
+
+          # Create .flatpakrepo file
+          printf '%s\n' \
+            "[Flatpak Repo]" \
+            "Title=OncleBob" \
+            "Url=https://flatpak.onclebob.com/" \
+            "Homepage=https://onclebob.com" \
+            "Description=OncleBob Flatpak Repository" \
+            "GPGKey=${GPG_PUBLIC_KEY}" \
+            > dist/onclebob.flatpakrepo
+
+          # Create .flatpakref file for direct app installation
+          printf '%s\n' \
+            "[Flatpak Ref]" \
+            "Name=com.onclebob.Bob" \
+            "Branch=master" \
+            "Title=OncleBob" \
+            "Url=https://flatpak.onclebob.com/" \
+            "RuntimeRepo=https://flathub.org/repo/flathub.flatpakrepo" \
+            "IsRuntime=false" \
+            "GPGKey=${GPG_PUBLIC_KEY}" \
+            > dist/onclebob.flatpakref
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Install xmit
+        run: go install github.com/xmit-co/xmit@latest
 
       - name: Upload to xmit
         env:
           XMIT_KEY: ${{ secrets.XMIT_KEY }}
-        run: |
-          /usr/local/bin/xmit flatpak.onclebob.com
+        run: xmit flatpak.onclebob.com
